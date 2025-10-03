@@ -3,19 +3,154 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import datetime
+from datetime import datetime, timedelta
 import pytz
+import os
 
-# ================= Data Fetch =================
+
+# 🔹 Define folder for stock data
+DATA_DIR = os.path.join(os.path.dirname(__file__), "stock_data")
+os.makedirs(DATA_DIR, exist_ok=True)   # ensure folder exists
+
+
+def _force_numeric(df):
+    """Ensure OHLCV columns are numeric if present."""
+    for col in ["Open", "High", "Low", "Close", "Volume"]:
+        if col in df.columns and isinstance(df[col], (pd.Series, list, np.ndarray)):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+    return df
+
+
 def fetch_data(symbol, period="5d", interval="1m"):
+    """
+    Fetch data for a stock symbol.
+    - Saves CSV in stock_data/<SYMBOL>.csv
+    - If exists, appends only new rows
+    - Returns (DataFrame, message)
+    """
+    file_path = os.path.join(DATA_DIR, f"{symbol.replace('.', '_')}.csv")
+
+    # If CSV exists, load and update
+    if os.path.exists(file_path):
+        df_old = pd.read_csv(file_path, parse_dates=["Datetime"])
+        if not pd.api.types.is_datetime64tz_dtype(df_old["Datetime"]):
+            df_old["Datetime"] = pd.to_datetime(df_old["Datetime"], utc=True).dt.tz_convert("Asia/Singapore")
+        df_old = _force_numeric(df_old)
+
+        last_dt = df_old["Datetime"].max()
+
+        # Fetch new data after last_dt
+        df_new = yf.download(symbol, start=last_dt, interval=interval, auto_adjust=True, progress=False)
+
+        if not df_new.empty:
+            if isinstance(df_new.columns, pd.MultiIndex):
+                df_new.columns = [c[0] for c in df_new.columns]
+            df_new = df_new.reset_index()
+            df_new["Datetime"] = pd.to_datetime(df_new["Datetime"], utc=True).dt.tz_convert("Asia/Singapore")
+            df_new = _force_numeric(df_new)
+
+            before = len(df_old)
+            combined = pd.concat([df_old, df_new], ignore_index=True)
+            combined = combined.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+            combined.to_csv(file_path, index=False)
+
+            # ✅ Ensure datetime column is correct
+            combined["Datetime"] = pd.to_datetime(combined["Datetime"], errors="coerce", utc=True).dt.tz_convert("Asia/Singapore")
+            combined = combined.dropna(subset=["Datetime"]).reset_index(drop=True)
+            
+            combined.to_csv(file_path, index=False)
+            
+            added = len(combined) - before
+            msg = f"✅ Updated {symbol} with {added} new rows. Total rows: {len(combined)}"
+            return combined, msg
+
+        else:
+            msg = f"ℹ️ No new data for {symbol}. Using {len(df_old)} existing rows."
+            return df_old, msg
+
+    # If no CSV exists, fetch fresh data
     df = yf.download(symbol, period=period, interval=interval, auto_adjust=True, progress=False)
     if df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), f"⚠️ No data returned for {symbol}"
+
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = [c[0] for c in df.columns]
+
     df = df.reset_index()
     df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert("Asia/Singapore")
-    return df.dropna()
+    df = _force_numeric(df)
+    # ✅ Ensure datetime column is correct
+    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True).dt.tz_convert("Asia/Singapore")
+    df = df.dropna(subset=["Datetime"]).reset_index(drop=True)
+    
+    df.to_csv(file_path, index=False)
+    msg = f"📂 Created {symbol} dataset with {len(df)} rows."
+    return df, msg
 
-# ================= VWAP + Candlestick =================
+
+
+# ================== Plotting Functions ==================
+
+def plot_intraday_line(df, symbol, tz_name="Asia/Singapore", figsize=(8,3)):
+    """
+    Home-page chart: today's Close vs time (line) with Volume as bar chart (secondary axis).
+    """
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.dates as mdates
+    from datetime import datetime, timedelta
+    import pytz
+
+    if df is None or df.empty:
+        return None
+
+    # Ensure tz-aware datetime
+    if not pd.api.types.is_datetime64tz_dtype(df["Datetime"]):
+        df = df.copy()
+        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert(tz_name)
+    else:
+        df = df.copy()
+        df["Datetime"] = df["Datetime"].dt.tz_convert(tz_name)
+
+    # Get today only
+    tz = pytz.timezone(tz_name)
+    now = datetime.now(tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    today_df = df[(df["Datetime"] >= start) & (df["Datetime"] < end)].copy()
+    if today_df.empty:
+        return None
+
+    today_df["t_naive"] = today_df["Datetime"].dt.tz_localize(None)
+
+    # Plot price and volume
+    fig, ax1 = plt.subplots(figsize=figsize)
+
+    # Line for Close
+    ax1.plot(today_df["t_naive"], today_df["Close"], color="blue", linewidth=1.6, label="Close")
+    ax1.set_ylabel("Price (SGD)", color="blue")
+    ax1.tick_params(axis="y", labelcolor="blue")
+
+    # Second axis for Volume
+    ax2 = ax1.twinx()
+    ax2.bar(today_df["t_naive"], today_df["Volume"], width=0.0005, color="red", alpha=0.4, label="Volume")
+    ax2.set_ylabel("Volume", color="red")
+    ax2.tick_params(axis="y", labelcolor="red")
+
+    # X-axis formatting
+    ax1.xaxis.set_major_locator(mdates.HourLocator(interval=1))
+    ax1.xaxis.set_minor_locator(mdates.MinuteLocator(byminute=[0,15,30,45]))
+    ax1.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    fig.autofmt_xdate()
+
+    ax1.set_title(f"{symbol} — Today’s Price & Volume")
+    ax1.grid(True, linestyle="--", alpha=0.5)
+
+    fig.tight_layout()
+    return fig
+
+
+
 def plot_candlestick_vwap(df, symbol):
     df = df.copy()
     df["date_sgt"] = df["Datetime"].dt.date
@@ -29,8 +164,9 @@ def plot_candlestick_vwap(df, symbol):
     day["VWAP"] = day["pv"].cumsum() / day["Volume"].replace(0, np.nan).cumsum()
 
     last_close = float(day["Close"].iloc[-1])
-    R1, R2 = last_close * 1.06, last_close * 1.12
-    S1, S2 = last_close * 0.90, last_close * 0.85
+    R1, R2 = last_close * 1.01, last_close * 1.02
+    S1, S2 = last_close * 0.99, last_close * 0.98
+
     vwap_last = float(day["VWAP"].iloc[-1])
 
     # Candlestick
@@ -41,19 +177,13 @@ def plot_candlestick_vwap(df, symbol):
     fig, ax = plt.subplots(figsize=(13,6))
     ax.set_title(f"{symbol} — {last_date} (1m Candlesticks)")
 
-    # Wicks
     for _, r in day.iterrows():
         ax.vlines(r["mdates"], r["Low"], r["High"], linewidth=1)
-
-    # Bodies
-    for _, r in day.iterrows():
         lower, height = min(r["Open"], r["Close"]), abs(r["Close"]-r["Open"])
-        rect = plt.Rectangle((r["mdates"]-bar_w/2, lower),
-                             bar_w, height if height != 0 else 1e-10,
-                             fill=(r["Close"] < r["Open"]), linewidth=1)
-        ax.add_patch(rect)
+        ax.add_patch(plt.Rectangle((r["mdates"]-bar_w/2, lower),
+                                   bar_w, height if height != 0 else 1e-10,
+                                   fill=(r["Close"] < r["Open"]), linewidth=1))
 
-    # VWAP + Levels
     ax.plot(day["mdates"], day["VWAP"], label="VWAP", linewidth=1.5)
     for y, lbl in [(S2,"S2"), (S1,"S1"), (vwap_last,"VWAP"), (R1,"R1"), (R2,"R2")]:
         ax.axhline(y, linestyle="--", linewidth=1)
@@ -66,7 +196,7 @@ def plot_candlestick_vwap(df, symbol):
     ax.grid(True, linestyle="--", alpha=0.6)
     return fig
 
-# ================= Volume =================
+
 def plot_volume(df, symbol):
     df = df.copy()
     df["dt_sgt_naive"] = df["Datetime"].dt.tz_convert("Asia/Singapore").dt.tz_localize(None)
@@ -80,7 +210,7 @@ def plot_volume(df, symbol):
     ax.grid(True, linestyle="--", alpha=0.6)
     return fig
 
-# ================= Breakout/Blowoff Detector =================
+
 def plot_detector(df, symbol):
     df = df.copy().sort_values("Datetime").reset_index(drop=True)
     df["date_sgt"] = df["Datetime"].dt.date
@@ -149,4 +279,57 @@ def plot_detector(df, symbol):
     fig.autofmt_xdate()
     ax.set_xlabel("Time (SGT)"); ax.set_ylabel("Price (SGD)")
     ax.grid(True, linestyle="--", alpha=0.6)
+
+    # Return both figure and latest signals
     return fig, df[df["date_sgt"] == last_date][["Datetime","Open","High","Low","Close","Volume","VWAP","breakout","blowoff"]]
+
+
+def plot_3mths_candlestick(df, symbol, months=3):
+    """Plot a line chart of Close prices for the last N months with wider R1/R2/S1/S2 levels."""
+ 
+
+    df = df.copy()
+
+    # Filter to last N months
+    cutoff = datetime.now(pytz.timezone("Asia/Singapore")) - pd.DateOffset(months=months)
+    df = df[df["Datetime"] >= cutoff]
+
+    if df.empty:
+        return None
+
+    # Last close
+    last_close = float(df["Close"].iloc[-1])
+
+    # Wider ranges (±10% and ±20%)
+    R1, R2 = last_close * 1.10, last_close * 1.20
+    S1, S2 = last_close * 0.90, last_close * 0.80
+
+    # Prepare datetime
+    df["dt_naive"] = df["Datetime"].dt.tz_localize(None)
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(13, 5))
+    ax.plot(df["dt_naive"], df["Close"], label="Close Price", color="blue")
+
+    # Add support/resistance lines
+    for y, lbl in [(S2, "S2"), (S1, "S1"), (last_close, "Close"), (R1, "R1"), (R2, "R2")]:
+        ax.axhline(y, linestyle="--", linewidth=1, color="green" if "R" in lbl else "red")
+        ax.text(df["dt_naive"].iloc[0], y, f" {lbl} {y:.3f}", va="bottom", fontsize=9)
+
+    # ✅ Format x-axis: weekly ticks, rotated 45 degrees
+    # Format x-axis ticks
+    ax.xaxis.set_major_locator(mdates.DayLocator(interval=7))  # tick every 7 days
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    plt.setp(ax.get_xticklabels(), rotation=45, ha="right")
+
+
+    # Labels & grid
+    ax.set_title(f"{symbol} — Last {months} Months (Line Chart)")
+    ax.set_xlabel("Date")
+    ax.set_ylabel("Price (SGD)")
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.6)
+
+    return fig
+
+
