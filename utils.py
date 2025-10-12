@@ -8,9 +8,11 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from datetime import datetime, timedelta
 
-# ---- Data Directory ----
+# ---- Data Directory & Timezone ----
 DATA_DIR = os.path.join(os.path.dirname(__file__), "stock_data")
 os.makedirs(DATA_DIR, exist_ok=True)  # Ensure folder exists
+
+TARGET_TZ = pytz.timezone("Asia/Singapore")
 
 
 # ---- Helpers ----
@@ -20,6 +22,35 @@ def _force_numeric(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns and isinstance(df[col], (pd.Series, list, np.ndarray)):
             df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+def _ensure_datetime_tz(df: pd.DataFrame, column: str = "Datetime", tz=TARGET_TZ) -> pd.DataFrame:
+    """Coerce a datetime column to timezone-aware values in the configured timezone."""
+    if column not in df.columns:
+        return df
+
+    if not pd.api.types.is_datetime64_any_dtype(df[column]):
+        df[column] = pd.to_datetime(df[column], errors="coerce", utc=True)
+    elif not pd.api.types.is_datetime64tz_dtype(df[column]):
+        df[column] = df[column].dt.tz_localize("UTC")
+
+    df[column] = df[column].dt.tz_convert(tz)
+    df = df.dropna(subset=[column]).sort_values(column)
+    return df.reset_index(drop=True)
+
+
+def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Compute the Relative Strength Index (RSI)."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace({0: np.nan})
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(method="bfill")
 
 
 # ---- Fetch Data ----
@@ -35,29 +66,46 @@ def fetch_data(symbol: str, period="5d", interval="1m"):
     # If CSV exists, load and update
     if os.path.exists(file_path):
         df_old = pd.read_csv(file_path, parse_dates=["Datetime"])
-        if not pd.api.types.is_datetime64tz_dtype(df_old["Datetime"]):
-            df_old["Datetime"] = pd.to_datetime(df_old["Datetime"], utc=True).dt.tz_convert("Asia/Singapore")
-        df_old = _force_numeric(df_old)
+        df_old = _ensure_datetime_tz(_force_numeric(df_old))
 
-        last_dt = df_old["Datetime"].max()
+        if df_old.empty:
+            last_dt = None
+        else:
+            last_dt = df_old["Datetime"].max()
 
-        # Fetch new data after last_dt
-        df_new = yf.download(symbol, start=last_dt, interval=interval, auto_adjust=True, progress=False)
+        df_new = pd.DataFrame()
+        if last_dt is not None and pd.notna(last_dt):
+            # Fetch new data after last_dt (pad by one bar to avoid gaps)
+            start_dt = last_dt.astimezone(pytz.UTC) - timedelta(minutes=1)
+            df_new = yf.download(
+                symbol,
+                start=start_dt.replace(tzinfo=None),
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
+        else:
+            df_new = yf.download(
+                symbol,
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+            )
 
         if not df_new.empty:
             if isinstance(df_new.columns, pd.MultiIndex):
                 df_new.columns = [c[0] for c in df_new.columns]
             df_new = df_new.reset_index()
-            df_new["Datetime"] = pd.to_datetime(df_new["Datetime"], utc=True).dt.tz_convert("Asia/Singapore")
             df_new = _force_numeric(df_new)
+            df_new = _ensure_datetime_tz(df_new)
 
             before = len(df_old)
             combined = pd.concat([df_old, df_new], ignore_index=True)
             combined = combined.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
 
             # ✅ Ensure datetime consistency
-            combined["Datetime"] = pd.to_datetime(combined["Datetime"], errors="coerce", utc=True).dt.tz_convert("Asia/Singapore")
-            combined = combined.dropna(subset=["Datetime"]).reset_index(drop=True)
+            combined = _ensure_datetime_tz(combined)
 
             combined.to_csv(file_path, index=False)
 
@@ -78,12 +126,10 @@ def fetch_data(symbol: str, period="5d", interval="1m"):
         df.columns = [c[0] for c in df.columns]
 
     df = df.reset_index()
-    df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert("Asia/Singapore")
     df = _force_numeric(df)
 
     # ✅ Ensure datetime consistency
-    df["Datetime"] = pd.to_datetime(df["Datetime"], errors="coerce", utc=True).dt.tz_convert("Asia/Singapore")
-    df = df.dropna(subset=["Datetime"]).reset_index(drop=True)
+    df = _ensure_datetime_tz(df)
 
     df.to_csv(file_path, index=False)
     msg = f"📂 Created {symbol} dataset with {len(df)} rows."
@@ -91,20 +137,16 @@ def fetch_data(symbol: str, period="5d", interval="1m"):
 
 
 # ---- Plot: Intraday Line + Volume ----
-def plot_intraday_line(df, symbol, tz_name="Asia/Singapore", figsize=(8, 3)):
+def plot_intraday_line(df, symbol, tz_name: str = TARGET_TZ.zone, figsize=(8, 3)):
     """Today's Close vs Time (line) with Volume as secondary bar axis."""
     if df is None or df.empty:
         return None
 
     # Ensure tz-aware datetime
-    df = df.copy()
-    if not pd.api.types.is_datetime64tz_dtype(df["Datetime"]):
-        df["Datetime"] = pd.to_datetime(df["Datetime"], utc=True).dt.tz_convert(tz_name)
-    else:
-        df["Datetime"] = df["Datetime"].dt.tz_convert(tz_name)
+    tz = pytz.timezone(tz_name)
+    df = _ensure_datetime_tz(df.copy(), tz=tz)
 
     # Filter to today only
-    tz = pytz.timezone(tz_name)
     now = datetime.now(tz)
     start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
@@ -141,12 +183,103 @@ def plot_intraday_line(df, symbol, tz_name="Asia/Singapore", figsize=(8, 3)):
     return fig
 
 
+# ---- Technical Indicators ----
+def compute_intraday_indicators(df: pd.DataFrame, tz_name: str = TARGET_TZ.zone) -> pd.DataFrame:
+    """Return today's intraday data enriched with common technical indicators."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    tz = pytz.timezone(tz_name)
+    data = _ensure_datetime_tz(df.copy(), tz=tz)
+    now = datetime.now(tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+
+    today_df = data[(data["Datetime"] >= start) & (data["Datetime"] < end)].copy()
+    if today_df.empty:
+        return pd.DataFrame()
+
+    today_df = today_df.sort_values("Datetime").reset_index(drop=True)
+
+    # Moving averages
+    today_df["SMA_20"] = today_df["Close"].rolling(window=20, min_periods=1).mean()
+    today_df["EMA_20"] = today_df["Close"].ewm(span=20, adjust=False, min_periods=1).mean()
+    today_df["EMA_50"] = today_df["Close"].ewm(span=50, adjust=False, min_periods=1).mean()
+
+    # RSI and MACD
+    today_df["RSI_14"] = _compute_rsi(today_df["Close"], period=14)
+
+    ema_fast = today_df["Close"].ewm(span=12, adjust=False, min_periods=1).mean()
+    ema_slow = today_df["Close"].ewm(span=26, adjust=False, min_periods=1).mean()
+    today_df["MACD"] = ema_fast - ema_slow
+    today_df["MACD_signal"] = today_df["MACD"].ewm(span=9, adjust=False, min_periods=1).mean()
+    today_df["MACD_hist"] = today_df["MACD"] - today_df["MACD_signal"]
+
+    return today_df
+
+
+def plot_price_with_mas(df: pd.DataFrame, symbol: str, figsize=(10, 4)):
+    """Plot close price with selected moving averages."""
+    if df is None or df.empty:
+        return None
+
+    data = df.copy()
+    data["t_naive"] = data["Datetime"].dt.tz_localize(None)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(data["t_naive"], data["Close"], label="Close", color="tab:blue", linewidth=1.4)
+    ax.plot(data["t_naive"], data["SMA_20"], label="SMA 20", color="tab:orange", linewidth=1.2)
+    ax.plot(data["t_naive"], data["EMA_20"], label="EMA 20", color="tab:green", linewidth=1.2, linestyle="--")
+    ax.plot(data["t_naive"], data["EMA_50"], label="EMA 50", color="tab:red", linewidth=1.2, linestyle=":")
+
+    ax.set_title(f"{symbol} — Intraday Price with Moving Averages")
+    ax.set_ylabel("Price (SGD)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    fig.autofmt_xdate()
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_rsi_macd(df: pd.DataFrame, symbol: str, figsize=(10, 5)):
+    """Plot RSI and MACD panels for intraday data."""
+    if df is None or df.empty:
+        return None
+
+    data = df.copy()
+    data["t_naive"] = data["Datetime"].dt.tz_localize(None)
+
+    fig, (ax_rsi, ax_macd) = plt.subplots(2, 1, sharex=True, figsize=figsize)
+
+    ax_rsi.plot(data["t_naive"], data["RSI_14"], color="tab:purple", linewidth=1.2)
+    ax_rsi.axhline(70, color="red", linestyle="--", linewidth=0.9)
+    ax_rsi.axhline(30, color="green", linestyle="--", linewidth=0.9)
+    ax_rsi.set_ylabel("RSI (14)")
+    ax_rsi.set_title(f"{symbol} — RSI & MACD")
+    ax_rsi.grid(True, linestyle="--", alpha=0.4)
+
+    ax_macd.plot(data["t_naive"], data["MACD"], label="MACD", color="tab:blue", linewidth=1.2)
+    ax_macd.plot(data["t_naive"], data["MACD_signal"], label="Signal", color="tab:orange", linewidth=1.0)
+    ax_macd.bar(data["t_naive"], data["MACD_hist"], width=0.0006, color="tab:gray", alpha=0.5, label="Histogram")
+    ax_macd.axhline(0, color="black", linewidth=0.8)
+    ax_macd.set_ylabel("MACD")
+    ax_macd.legend()
+    ax_macd.grid(True, linestyle="--", alpha=0.4)
+
+    ax_macd.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    fig.autofmt_xdate()
+    fig.tight_layout()
+    return fig
+
+
 # ---- Plot: Candlestick + VWAP ----
 def plot_candlestick_vwap(df, symbol):
     """Plot candlestick chart for today with VWAP and support/resistance levels."""
-    df = df.copy()
+    df = _ensure_datetime_tz(df.copy())
     df["date_sgt"] = df["Datetime"].dt.date
-    today_sgt = datetime.now(pytz.timezone("Asia/Singapore")).date()
+    today_sgt = datetime.now(TARGET_TZ).date()
     last_date = df["date_sgt"].max() if today_sgt not in df["date_sgt"].unique() else today_sgt
     day = df[df["date_sgt"] == last_date].copy()
 
@@ -161,7 +294,7 @@ def plot_candlestick_vwap(df, symbol):
     vwap_last = float(day["VWAP"].iloc[-1])
 
     # Prepare candlesticks
-    day["dt_sgt_naive"] = day["Datetime"].dt.tz_convert("Asia/Singapore").dt.tz_localize(None)
+    day["dt_sgt_naive"] = day["Datetime"].dt.tz_convert(TARGET_TZ).dt.tz_localize(None)
     day["mdates"] = mdates.date2num(day["dt_sgt_naive"])
     bar_w = 60.0 / (24 * 60 * 60) * 0.9
 
@@ -195,8 +328,8 @@ def plot_candlestick_vwap(df, symbol):
 # ---- Plot: Volume ----
 def plot_volume(df, symbol):
     """Plot volume chart (1m bars)."""
-    df = df.copy()
-    df["dt_sgt_naive"] = df["Datetime"].dt.tz_convert("Asia/Singapore").dt.tz_localize(None)
+    df = _ensure_datetime_tz(df.copy())
+    df["dt_sgt_naive"] = df["Datetime"].dt.tz_convert(TARGET_TZ).dt.tz_localize(None)
     bar_w = 60.0 / (24 * 60 * 60) * 0.9
 
     fig, ax = plt.subplots(figsize=(13, 3.5))
@@ -212,7 +345,7 @@ def plot_volume(df, symbol):
 # ---- Plot: Detector ----
 def plot_detector(df, symbol):
     """Plot candlestick + VWAP + detector signals (breakout/blowoff)."""
-    df = df.copy().sort_values("Datetime").reset_index(drop=True)
+    df = _ensure_datetime_tz(df.copy()).sort_values("Datetime").reset_index(drop=True)
     df["date_sgt"] = df["Datetime"].dt.date
 
     # VWAP
@@ -252,7 +385,7 @@ def plot_detector(df, symbol):
     # Last day subset
     last_date = df["date_sgt"].max()
     day = df[df["date_sgt"] == last_date].copy()
-    day["dt_sgt_naive"] = day["Datetime"].dt.tz_convert("Asia/Singapore").dt.tz_localize(None)
+    day["dt_sgt_naive"] = day["Datetime"].dt.tz_convert(TARGET_TZ).dt.tz_localize(None)
     day["mdates"] = mdates.date2num(day["dt_sgt_naive"])
     bar_w = 60.0 / (24 * 60 * 60) * 0.9
 
@@ -289,10 +422,10 @@ def plot_detector(df, symbol):
 # ---- Plot: 3-Month Candlestick ----
 def plot_3mths_candlestick(df, symbol, months=3):
     """Plot Close prices for the last N months with support/resistance levels."""
-    df = df.copy()
+    df = _ensure_datetime_tz(df.copy())
 
     # Filter to last N months
-    cutoff = datetime.now(pytz.timezone("Asia/Singapore")) - pd.DateOffset(months=months)
+    cutoff = datetime.now(TARGET_TZ) - pd.DateOffset(months=months)
     df = df[df["Datetime"] >= cutoff]
     if df.empty:
         return None

@@ -7,6 +7,8 @@ This app allows you to:
 ✅ Automatically refresh data every 5 minutes
 ✅ Store and update data locally (/stock_data folder)
 ✅ View intraday price + volume charts (per minute)
+✅ Analyse intraday technical indicators (SMA, EMA, RSI, MACD)
+✅ Automatically normalise timestamps to Asia/Singapore time for consistent analysis
 ✅ Access detailed tabs with:
 
 Daily candlestick + VWAP
@@ -35,6 +37,8 @@ Key stats: Open, High, Low, Last Close, % change
 Details Page (Tabs) →
 
 Daily candlestick + VWAP
+
+Intraday technical indicator dashboard (metrics, MA overlay, RSI & MACD panels)
 
 Intraday volume bars
 
