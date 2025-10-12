@@ -22,6 +22,20 @@ def _force_numeric(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def _compute_rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Compute the Relative Strength Index (RSI)."""
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+
+    avg_gain = gain.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+    rs = avg_gain / avg_loss.replace({0: np.nan})
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.fillna(method="bfill")
+
+
 # ---- Fetch Data ----
 def fetch_data(symbol: str, period="5d", interval="1m"):
     """
@@ -137,6 +151,102 @@ def plot_intraday_line(df, symbol, tz_name="Asia/Singapore", figsize=(8, 3)):
     ax1.set_title(f"{symbol} — Today’s Price & Volume")
     ax1.grid(True, linestyle="--", alpha=0.5)
 
+    fig.tight_layout()
+    return fig
+
+
+# ---- Technical Indicators ----
+def compute_intraday_indicators(df: pd.DataFrame, tz_name: str = "Asia/Singapore") -> pd.DataFrame:
+    """Return today's intraday data enriched with common technical indicators."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    data = df.copy()
+    if not pd.api.types.is_datetime64tz_dtype(data["Datetime"]):
+        data["Datetime"] = pd.to_datetime(data["Datetime"], utc=True).dt.tz_convert(tz_name)
+    else:
+        data["Datetime"] = data["Datetime"].dt.tz_convert(tz_name)
+
+    tz = pytz.timezone(tz_name)
+    now = datetime.now(tz)
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+
+    today_df = data[(data["Datetime"] >= start) & (data["Datetime"] < end)].copy()
+    if today_df.empty:
+        return pd.DataFrame()
+
+    today_df = today_df.sort_values("Datetime").reset_index(drop=True)
+
+    # Moving averages
+    today_df["SMA_20"] = today_df["Close"].rolling(window=20, min_periods=1).mean()
+    today_df["EMA_20"] = today_df["Close"].ewm(span=20, adjust=False, min_periods=1).mean()
+    today_df["EMA_50"] = today_df["Close"].ewm(span=50, adjust=False, min_periods=1).mean()
+
+    # RSI and MACD
+    today_df["RSI_14"] = _compute_rsi(today_df["Close"], period=14)
+
+    ema_fast = today_df["Close"].ewm(span=12, adjust=False, min_periods=1).mean()
+    ema_slow = today_df["Close"].ewm(span=26, adjust=False, min_periods=1).mean()
+    today_df["MACD"] = ema_fast - ema_slow
+    today_df["MACD_signal"] = today_df["MACD"].ewm(span=9, adjust=False, min_periods=1).mean()
+    today_df["MACD_hist"] = today_df["MACD"] - today_df["MACD_signal"]
+
+    return today_df
+
+
+def plot_price_with_mas(df: pd.DataFrame, symbol: str, figsize=(10, 4)):
+    """Plot close price with selected moving averages."""
+    if df is None or df.empty:
+        return None
+
+    data = df.copy()
+    data["t_naive"] = data["Datetime"].dt.tz_localize(None)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(data["t_naive"], data["Close"], label="Close", color="tab:blue", linewidth=1.4)
+    ax.plot(data["t_naive"], data["SMA_20"], label="SMA 20", color="tab:orange", linewidth=1.2)
+    ax.plot(data["t_naive"], data["EMA_20"], label="EMA 20", color="tab:green", linewidth=1.2, linestyle="--")
+    ax.plot(data["t_naive"], data["EMA_50"], label="EMA 50", color="tab:red", linewidth=1.2, linestyle=":")
+
+    ax.set_title(f"{symbol} — Intraday Price with Moving Averages")
+    ax.set_ylabel("Price (SGD)")
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    fig.autofmt_xdate()
+    ax.legend()
+    ax.grid(True, linestyle="--", alpha=0.5)
+
+    fig.tight_layout()
+    return fig
+
+
+def plot_rsi_macd(df: pd.DataFrame, symbol: str, figsize=(10, 5)):
+    """Plot RSI and MACD panels for intraday data."""
+    if df is None or df.empty:
+        return None
+
+    data = df.copy()
+    data["t_naive"] = data["Datetime"].dt.tz_localize(None)
+
+    fig, (ax_rsi, ax_macd) = plt.subplots(2, 1, sharex=True, figsize=figsize)
+
+    ax_rsi.plot(data["t_naive"], data["RSI_14"], color="tab:purple", linewidth=1.2)
+    ax_rsi.axhline(70, color="red", linestyle="--", linewidth=0.9)
+    ax_rsi.axhline(30, color="green", linestyle="--", linewidth=0.9)
+    ax_rsi.set_ylabel("RSI (14)")
+    ax_rsi.set_title(f"{symbol} — RSI & MACD")
+    ax_rsi.grid(True, linestyle="--", alpha=0.4)
+
+    ax_macd.plot(data["t_naive"], data["MACD"], label="MACD", color="tab:blue", linewidth=1.2)
+    ax_macd.plot(data["t_naive"], data["MACD_signal"], label="Signal", color="tab:orange", linewidth=1.0)
+    ax_macd.bar(data["t_naive"], data["MACD_hist"], width=0.0006, color="tab:gray", alpha=0.5, label="Histogram")
+    ax_macd.axhline(0, color="black", linewidth=0.8)
+    ax_macd.set_ylabel("MACD")
+    ax_macd.legend()
+    ax_macd.grid(True, linestyle="--", alpha=0.4)
+
+    ax_macd.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    fig.autofmt_xdate()
     fig.tight_layout()
     return fig
 
